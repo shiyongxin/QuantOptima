@@ -65,7 +65,7 @@ def run_optimization(args):
             print(f"  - {issue}")
 
     # 初始化引擎
-    engine = OptimizationEngine(data_dir=args.data_dir)
+    engine = OptimizationEngine(data_dir=args.data_dir, use_gpu=args.gpu)
 
     # 加载数据
     print("\n[INFO] 加载数据...")
@@ -189,6 +189,8 @@ def main():
                        help='体制标签文件')
     parser.add_argument('--output', default='stock_data/optimization_result.json',
                        help='输出文件路径')
+    parser.add_argument('--gpu', action='store_true',
+                       help='使用 GPU (Apple Silicon MPS) 加速')
 
     args = parser.parse_args()
     run_optimization(args)

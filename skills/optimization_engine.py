@@ -23,6 +23,13 @@ from parameter_space import ParameterSpace
 from vectorized_backtest import VectorizedBacktester, BacktestMetrics
 from historical_data_manager import HistoricalDataManager
 
+# GPU 支持 (可选)
+try:
+    from gpu_backtest import GPUBacktester, prepare_stock_tensor, get_device
+    GPU_AVAILABLE = True
+except ImportError:
+    GPU_AVAILABLE = False
+
 
 # ==================== 数据结构 ====================
 
@@ -77,7 +84,8 @@ class FitnessEvaluator:
     """
 
     def __init__(self, backtester=None, target_return=10.0,
-                 target_probability=0.80, max_drawdown_limit=25.0):
+                 target_probability=0.80, max_drawdown_limit=25.0,
+                 use_gpu=False):
         """
         Parameters:
         -----------
@@ -87,8 +95,17 @@ class FitnessEvaluator:
             目标达标概率
         max_drawdown_limit : float
             最大回撤限制(%)
+        use_gpu : bool
+            是否使用 GPU 加速
         """
-        self.backtester = backtester or VectorizedBacktester()
+        self.use_gpu = use_gpu and GPU_AVAILABLE
+        if self.use_gpu:
+            self.gpu_backtester = GPUBacktester()
+            self.backtester = backtester or VectorizedBacktester()  # fallback
+            print(f"[INFO] GPU 模式已启用 (设备: {self.gpu_backtester.device})")
+        else:
+            self.backtester = backtester or VectorizedBacktester()
+            self.gpu_backtester = None
         self.target_return = target_return
         self.target_probability = target_probability
         self.max_drawdown_limit = max_drawdown_limit
@@ -114,6 +131,17 @@ class FitnessEvaluator:
         --------
         (fitness: float, details: dict)
         """
+        # GPU 加速路径
+        if self.use_gpu and self.gpu_backtester and not target_regime:
+            try:
+                return self.gpu_backtester.evaluate_params_batch(
+                    stock_data, params, regime_labels, target_regime
+                )
+            except Exception as e:
+                # GPU 失败时回退到 CPU
+                pass
+
+        # CPU 路径 (原有逻辑)
         all_metrics = []
 
         for symbol, data in stock_data.items():
@@ -406,7 +434,7 @@ class GeneticAlgorithm:
         self.convergence_tolerance = convergence_tolerance
 
     def run(self, evaluate_fn, seed_params=None, rng=None,
-            verbose=True) -> tuple:
+            verbose=True, gpu_backtester=None, stock_data=None) -> tuple:
         """
         运行遗传算法
 
@@ -420,6 +448,10 @@ class GeneticAlgorithm:
             随机数生成器
         verbose : bool
             是否打印进度
+        gpu_backtester : GPUBacktester or None
+            GPU 回测引擎 (如果提供，使用批量评估)
+        stock_data : dict or None
+            {symbol: DataFrame} 股票数据 (GPU 批量评估需要)
 
         Returns:
         --------
@@ -437,15 +469,30 @@ class GeneticAlgorithm:
         no_improve_count = 0
         convergence_gen = 0
 
+        # 是否使用 GPU 批量评估
+        use_gpu_batch = (gpu_backtester is not None and stock_data is not None)
+
         for gen in range(self.max_generations):
             gen_start = time.time()
 
-            # 评估适应度
-            for ind in population:
-                if ind.fitness == 0:  # 未评估过
-                    fitness, details = evaluate_fn(ind.params)
-                    ind.fitness = fitness
-                    ind.fitness_details = details
+            if use_gpu_batch:
+                # GPU 批量评估: 整个种群一次性评估
+                unevaluated = [i for i, ind in enumerate(population) if ind.fitness == 0]
+                if unevaluated:
+                    params_list = [population[i].params for i in unevaluated]
+                    batch_results = gpu_backtester.evaluate_population(
+                        stock_data, params_list
+                    )
+                    for idx, (fitness, details) in zip(unevaluated, batch_results):
+                        population[idx].fitness = fitness
+                        population[idx].fitness_details = details
+            else:
+                # CPU 逐个评估
+                for ind in population:
+                    if ind.fitness == 0:  # 未评估过
+                        fitness, details = evaluate_fn(ind.params)
+                        ind.fitness = fitness
+                        ind.fitness_details = details
 
             # 排序
             population.sort(key=lambda x: x.fitness, reverse=True)
@@ -559,7 +606,7 @@ class OptimizationEngine:
     阶段3: 混合策略优化 → 跨体制稳健参数
     """
 
-    def __init__(self, data_dir="./stock_data", n_workers=4):
+    def __init__(self, data_dir="./stock_data", n_workers=4, use_gpu=False):
         """
         Parameters:
         -----------
@@ -567,10 +614,13 @@ class OptimizationEngine:
             数据目录
         n_workers : int
             并行工作线程数
+        use_gpu : bool
+            是否使用 GPU 加速
         """
+        self.use_gpu = use_gpu and GPU_AVAILABLE
         self.data_manager = HistoricalDataManager(data_dir)
         self.backtester = VectorizedBacktester()
-        self.evaluator = FitnessEvaluator(self.backtester)
+        self.evaluator = FitnessEvaluator(self.backtester, use_gpu=self.use_gpu)
         self.n_workers = n_workers
 
         self.results = {}       # {regime: OptimizationResult}
@@ -700,8 +750,16 @@ class OptimizationEngine:
         if verbose:
             print(f"  GA配置: pop={ga_cfg['population_size']}, "
                   f"max_gen={ga_cfg['max_generations']}")
+            if self.use_gpu:
+                print(f"  GPU 加速: 启用")
 
-        best, all_inds, conv_gen = ga.run(evaluate, verbose=verbose)
+        # GPU 批量评估模式
+        gpu_bt = self.evaluator.gpu_backtester if self.use_gpu else None
+
+        best, all_inds, conv_gen = ga.run(
+            evaluate, verbose=verbose,
+            gpu_backtester=gpu_bt, stock_data=sample_data
+        )
         total_time = time.time() - start_time
 
         # 构建结果

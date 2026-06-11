@@ -23,6 +23,8 @@ class DataConfig:
     end_date: str = None  # None表示今天
     stock_sample_size: int = 50
     specific_symbols: list = field(default_factory=list)
+    use_gpu: bool = False       # 是否使用 GPU 加速
+    gpu_batch_size: int = 50    # GPU 批量大小
 
 
 @dataclass
