@@ -2,3 +2,5 @@ stock_data/
 **/__pycache__/
 *.pyc
 optimize_full.log
+fetch_*.log
+.claude/
