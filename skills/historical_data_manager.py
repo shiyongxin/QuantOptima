@@ -318,17 +318,25 @@ class HistoricalDataManager:
         df = df.sort_values('symbol').reset_index(drop=True)
         return df
 
-    def get_universe(self, min_history_days: int = 5000,
-                     min_rows: int = 2000) -> list:
+    def get_universe(self, min_history_days: int = 180,
+                     min_rows: int = 100,
+                     use_real_data: bool = True) -> list:
         """
-        获取有足够历史数据的股票池
+        获取最近有交易的股票池。
+
+        默认以 parquet 文件中的真实数据为准（不依赖 metadata.row_count，
+        因为 metadata 在批量更新时可能被覆盖为错误值）。
 
         Parameters:
         -----------
         min_history_days : int
-            最少历史天数(自然日)
+            最少历史天数（自然日）。默认 180 ≈ 半年。
         min_rows : int
-            最少数据行数(交易日)
+            最少数据行数（交易日）。默认 100 ≈ 半年。
+        use_real_data : bool
+            True（默认）：打开 parquet 文件读取真实 row_count 和 last_date，
+                          可能慢但准确。
+            False：仅用 metadata（快，但 metadata 可能损坏）。
 
         Returns:
         --------
@@ -336,22 +344,38 @@ class HistoricalDataManager:
         """
         universe = []
         cutoff_date = datetime.now() - timedelta(days=min_history_days)
+        stocks_meta = self.metadata.get("stocks", {})
 
-        for sym, info in self.metadata.get("stocks", {}).items():
-            row_count = info.get("row_count", 0)
-            last_date_str = info.get("last_date", "")
-
-            if row_count < min_rows:
-                continue
-
-            try:
-                last_date = datetime.strptime(last_date_str, "%Y-%m-%d")
+        if use_real_data:
+            # 以 parquet 真实数据为准
+            for sym in stocks_meta.keys():
+                try:
+                    df = self.load(sym)
+                except Exception:
+                    continue
+                if len(df) < min_rows:
+                    continue
+                try:
+                    last_date = pd.to_datetime(df["日期"].iloc[-1]).to_pydatetime()
+                except Exception:
+                    continue
                 if last_date < cutoff_date:
                     continue
-            except:
-                continue
-
-            universe.append(sym)
+                universe.append(sym)
+        else:
+            # 仅用 metadata（快）
+            for sym, info in stocks_meta.items():
+                row_count = info.get("row_count", 0)
+                last_date_str = info.get("last_date", "")
+                if row_count < min_rows:
+                    continue
+                try:
+                    last_date = datetime.strptime(last_date_str, "%Y-%m-%d")
+                    if last_date < cutoff_date:
+                        continue
+                except Exception:
+                    continue
+                universe.append(sym)
 
         return sorted(universe)
 
@@ -408,13 +432,24 @@ class HistoricalDataManager:
         return sorted(self.metadata.get("stocks", {}).keys())
 
     def get_stock_name(self, symbol: str) -> str:
-        """获取股票名称(从stock_list.csv)"""
-        stock_list_path = Path(".claude/skills/stock_list.csv")
-        if stock_list_path.exists():
-            df = pd.read_csv(stock_list_path, encoding='utf-8-sig')
-            row = df[df['code'] == int(symbol)]
-            if len(row) > 0:
-                return row.iloc[0]['name']
+        """获取股票名称(从 stock_list.csv)"""
+        # 在多个候选路径中查找 stock_list.csv（路径在不同环境下不一致）
+        candidates = [
+            Path("skills/stock_list.csv"),
+            Path(".claude/skills/stock_list.csv"),
+            Path(__file__).parent / "stock_list.csv",  # 与本模块同目录
+        ]
+        for stock_list_path in candidates:
+            if stock_list_path.exists():
+                try:
+                    df = pd.read_csv(stock_list_path, encoding='utf-8-sig')
+                    col = 'code' if 'code' in df.columns else '股票代码'
+                    row = df[df[col] == int(symbol)]
+                    if len(row) > 0:
+                        name_col = 'name' if 'name' in df.columns else '股票名称'
+                        return row.iloc[0][name_col]
+                except Exception:
+                    continue
         return symbol
 
 

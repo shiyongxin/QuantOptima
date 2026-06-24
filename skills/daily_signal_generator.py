@@ -353,58 +353,89 @@ class DailySignalGenerator:
 
     def detect_current_regime(self, index_data=None) -> str:
         """
-        检测当前大盘态势
+        检测当前大盘态势。
+
+        实现策略（按优先级）：
+        1. 优先使用调用方传入的 index_data
+        2. 尝试从缓存加载"指数"代码数据（000300.SH / 000001.SH 等）
+           — ⚠️ 注意：腾讯/akshare 里的 000001 实际是"平安银行"个股，
+             不是上证指数。本方法加 .SH 后缀避免撞车，但仍可能取不到指数。
+        3. 若上面失败，使用 regime_labels.csv 最后一日的体制作为主判断
+           （regime_labels.csv 本身就是沪深300 体制分类器产出，最准）
+        4. 最后兜底：SIDEWAYS
 
         Parameters:
         -----------
         index_data : pd.DataFrame or None
-            指数数据，None则从缓存加载
+            指数数据，None 则自动加载
 
         Returns:
         --------
         str : 当前体制 "BULL" / "BEAR" / "SIDEWAYS" / "CRASH" / "RECOVERY"
         """
         if index_data is None:
-            # 尝试从缓存加载沪深300
-            index_data = self.data_manager.load('000300')
-            if len(index_data) == 0:
-                # 尝试加载上证指数
-                index_data = self.data_manager.load('000001')
+            # 优先用 .SH/.SZ 后缀的指数代码，从 indexes/ 目录读取
+            # （与个股分开存储，避免 000001=上证指数 也是=平安银行 的撞车）
+            for index_sym in ['sh000300', 'sh000001', 'sh000905', 'sh000852']:
+                index_data = self.data_manager.load_index(index_sym)
+                if len(index_data) >= 100:
+                    break
+            else:
+                print("[INFO] 库中无指数数据（indexes/ 目录为空），跳过主路径")
+                index_data = None
 
-        if len(index_data) < 120:
-            print("[WARN] 指数数据不足，默认SIDEWAYS")
-            self._current_regime = 'SIDEWAYS'
-            return 'SIDEWAYS'
+        # 主路径：用指数数据实时判断
+        if index_data is not None and len(index_data) >= 60:
+            # 数据不足 120 行（半年）时打印提示，但仍尝试用现有数据判断
+            if len(index_data) < 120:
+                print(f"[INFO] 指数数据 {len(index_data)} 行（<120），使用短期窗口判断")
+            close = index_data['收盘'].astype(float)
+            # 根据可用数据量动态调整窗口
+            window_short = min(20, len(close) // 6)
+            window_mid = min(60, len(close) // 3)
+            window_long = min(120, len(close) // 2)
+            ma_mid = close.rolling(window_mid).mean()
+            ma_long = close.rolling(window_long).mean()
+            ret_window = max(window_short, 5)
+            ret_20d = close.pct_change(ret_window) * 100
+            ret_5d = close.pct_change(5) * 100
+            ret_month = close.pct_change(ret_window) * 100
 
-        close = index_data['收盘'].astype(float)
-        ma60 = close.rolling(60).mean()
-        ma120 = close.rolling(120).mean()
-        ret_20d = close.pct_change(20) * 100
-        ret_5d = close.pct_change(5) * 100
-        ret_month = close.pct_change(20) * 100
+            latest_ma_mid = ma_mid.iloc[-1]
+            latest_ma_long = ma_long.iloc[-1]
+            latest_ret20 = ret_20d.iloc[-1]
+            latest_ret5 = ret_5d.iloc[-1]
+            latest_ret_month = ret_month.iloc[-1]
 
-        latest_ma60 = ma60.iloc[-1]
-        latest_ma120 = ma120.iloc[-1]
-        latest_ret20 = ret_20d.iloc[-1]
-        latest_ret5 = ret_5d.iloc[-1]
-        latest_ret_month = ret_month.iloc[-1]
+            if not pd.isna(latest_ma_long):
+                if latest_ret_month < -10 or latest_ret5 < -8:
+                    regime = 'CRASH'
+                elif latest_ma_mid > latest_ma_long and latest_ret20 > 5:
+                    regime = 'BULL'
+                elif latest_ma_mid < latest_ma_long and latest_ret20 < -5:
+                    regime = 'BEAR'
+                elif latest_ma_mid > latest_ma_long and latest_ret20 > 0:
+                    regime = 'BULL'
+                elif latest_ma_mid < latest_ma_long and latest_ret20 < 0:
+                    regime = 'BEAR'
+                else:
+                    regime = 'SIDEWAYS'
+                self._current_regime = regime
+                return regime
 
-        # 分类逻辑 (与 MarketRegimeClassifier 一致)
-        if latest_ret_month < -10 or latest_ret5 < -8:
-            regime = 'CRASH'
-        elif latest_ma60 > latest_ma120 and latest_ret20 > 5:
-            regime = 'BULL'
-        elif latest_ma60 < latest_ma120 and latest_ret20 < -5:
-            regime = 'BEAR'
-        elif latest_ma60 > latest_ma120 and latest_ret20 > 0:
-            regime = 'BULL'
-        elif latest_ma60 < latest_ma120 and latest_ret20 < 0:
-            regime = 'BEAR'
-        else:
-            regime = 'SIDEWAYS'
+        # 兜底：regime_labels.csv 最后一日（这个文件本身就是沪深300 体制分类器产出）
+        print("[INFO] 指数数据不可用，使用 regime_labels.csv 最后一日体制")
+        if self._index_labels is not None and len(self._index_labels) > 0:
+            last = self._index_labels.iloc[-1]
+            regime = str(last['regime']).upper()
+            if regime in ('BULL', 'BEAR', 'SIDEWAYS', 'CRASH', 'RECOVERY'):
+                self._current_regime = regime
+                return regime
 
-        self._current_regime = regime
-        return regime
+        # 终极兜底
+        print("[WARN] regime_labels.csv 也无有效数据，默认SIDEWAYS")
+        self._current_regime = 'SIDEWAYS'
+        return 'SIDEWAYS'
 
     def get_params_for_regime(self, regime: str) -> dict:
         """获取指定体制的参数"""
@@ -526,7 +557,7 @@ class DailySignalGenerator:
 
         # 获取股票池
         if symbols is None:
-            symbols = self.data_manager.get_universe(min_rows=2000)
+            symbols = self.data_manager.get_universe()
             if len(symbols) > n_stocks:
                 import random
                 symbols = random.sample(symbols, n_stocks)
