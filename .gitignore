@@ -4,3 +4,4 @@ stock_data/
 optimize_full.log
 fetch_*.log
 .claude/
+optimization_package/

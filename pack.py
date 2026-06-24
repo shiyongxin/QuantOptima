@@ -32,7 +32,7 @@ SKILLS = [
 ]
 
 def main():
-    src_dir = Path('.claude/skills')
+    src_dir = Path('skills')
     dst_dir = Path('optimization_package/skills')
     dst_dir.mkdir(parents=True, exist_ok=True)
 
