@@ -31,10 +31,25 @@ class HistoricalDataManager:
     - 股票池管理: 按历史天数过滤
     """
 
+    # 支持的核心指数：name → 中文名
+    SUPPORTED_INDEXES = {
+        'sh000300': '沪深300',
+        'sh000001': '上证指数',
+        'sh000905': '中证500',
+        'sh000852': '中证1000',
+        'sh000016': '上证50',
+        'sz399001': '深证成指',
+        'sz399006': '创业板指',
+        'sz399905': '中证500(深)',
+    }
+
     def __init__(self, data_dir="./stock_data"):
         self.data_dir = Path(data_dir)
         self.historical_dir = self.data_dir / "historical"
         self.historical_dir.mkdir(parents=True, exist_ok=True)
+        # 指数数据目录（与个股分开存储，避免 000001 这种"指数代码==个股代码"的撞车）
+        self.indexes_dir = self.data_dir / "indexes"
+        self.indexes_dir.mkdir(parents=True, exist_ok=True)
         self.metadata_file = self.historical_dir / "metadata.json"
         self.metadata = self._load_metadata()
 
@@ -65,6 +80,118 @@ class HistoricalDataManager:
     def _get_parquet_path(self, symbol: str) -> Path:
         """获取Parquet文件路径"""
         return self.historical_dir / f"{str(symbol).zfill(6)}.parquet"
+
+    # ========== 指数数据管理（与个股分开存储，避免 000001/000300 代码撞车） ==========
+
+    def _get_index_path(self, symbol: str) -> Path:
+        """获取指数 Parquet 文件路径（存储在 indexes/ 子目录）"""
+        return self.indexes_dir / f"{symbol}.parquet"
+
+    def fetch_index(self, symbol: str, force: bool = False) -> pd.DataFrame:
+        """
+        获取并缓存大盘指数数据。
+
+        重要：指数代码必须用带交易所后缀的形式（如 sh000300 / sz399001），
+        与个股代码（如 000001 平安银行）区分开。
+
+        Parameters:
+        -----------
+        symbol : str
+            指数代码，必须带交易所前缀（sh/sz），如 'sh000300'
+        force : bool
+            True 强制重新拉取（忽略已有缓存）
+
+        Returns:
+        --------
+        pd.DataFrame : 指数历史数据，列名与个股一致：日期/开盘/收盘/最高/最低/成交量
+        """
+        symbol = str(symbol).strip().lower()
+        if symbol not in self.SUPPORTED_INDEXES:
+            print(f"[WARN] {symbol} 不在 SUPPORTED_INDEXES 列表中，仍尝试拉取")
+        index_path = self._get_index_path(symbol)
+
+        # 检查缓存（指数数据通常由数据源决定起止日，不做增量）
+        if index_path.exists() and not force:
+            try:
+                df = pd.read_parquet(index_path)
+                if len(df) > 0:
+                    last_date = pd.to_datetime(df['日期'].iloc[-1])
+                    if last_date >= pd.to_datetime(datetime.now()) - timedelta(days=3):
+                        print(f"[OK] {symbol} 缓存已是最新: {len(df)} 行 (最新 {df['日期'].iloc[-1]})")
+                        return df
+            except Exception as e:
+                print(f"[WARN] 读 {symbol} 缓存失败: {e}")
+
+        # 从 akshare 拉取
+        print(f"[INFO] 从 akshare 拉取 {symbol} ({self.SUPPORTED_INDEXES.get(symbol, '未知指数')})...")
+        try:
+            raw = ak.stock_zh_index_daily(symbol)
+        except Exception as e:
+            print(f"[ERROR] {symbol} 拉取失败: {e}")
+            return pd.DataFrame()
+
+        if raw is None or len(raw) == 0:
+            print(f"[WARN] {symbol} 接口返回空")
+            return pd.DataFrame()
+
+        # 列名映射：akshare 指数接口返回 date/open/high/low/close/volume
+        # 统一为个股的列名格式（中文），方便后续代码通用
+        df = pd.DataFrame({
+            '日期': pd.to_datetime(raw['date']),
+            '开盘': raw['open'].astype(float),
+            '收盘': raw['close'].astype(float),
+            '最高': raw['high'].astype(float),
+            '最低': raw['low'].astype(float),
+            '成交量': raw['volume'].astype(float),
+        })
+        df = df.sort_values('日期').reset_index(drop=True)
+        df = df.drop_duplicates(subset=['日期'], keep='last')
+
+        # 保存到 Parquet
+        try:
+            df.to_parquet(index_path, engine='pyarrow', compression='snappy',
+                          index=False)
+            print(f"[OK] {symbol} 已保存: {len(df)} 行 ({df['日期'].iloc[0].date()} ~ {df['日期'].iloc[-1].date()})")
+        except Exception as e:
+            print(f"[ERROR] {symbol} 保存失败: {e}")
+
+        # 更新 metadata
+        if "indexes" not in self.metadata:
+            self.metadata["indexes"] = {}
+        self.metadata["indexes"][symbol] = {
+            "name": self.SUPPORTED_INDEXES.get(symbol, "未知"),
+            "row_count": len(df),
+            "first_date": str(df['日期'].iloc[0].date()),
+            "last_date": str(df['日期'].iloc[-1].date()),
+            "last_update": datetime.now().isoformat(),
+        }
+        self._save_metadata()
+
+        return df
+
+    def load_index(self, symbol: str) -> pd.DataFrame:
+        """
+        加载指数数据（只从 indexes/ 目录读，不与个股混淆）。
+
+        Parameters:
+        -----------
+        symbol : str
+            指数代码（必须带 sh/sz 前缀）
+
+        Returns:
+        --------
+        pd.DataFrame : 空表表示未缓存
+        """
+        symbol = str(symbol).strip().lower()
+        index_path = self._get_index_path(symbol)
+        if index_path.exists():
+            try:
+                df = pd.read_parquet(index_path)
+                df['日期'] = pd.to_datetime(df['日期'])
+                return df
+            except Exception as e:
+                print(f"[WARN] 读 {symbol} 失败: {e}")
+        return pd.DataFrame()
 
     def fetch_and_cache(self, symbol: str, start_date: str = "19960101",
                         end_date: str = None) -> pd.DataFrame:
@@ -487,6 +614,17 @@ def main():
     p_validate = subparsers.add_parser('validate', help='验证数据完整性')
     p_validate.add_argument('symbol', nargs='?', help='股票代码(不指定则验证全部)')
 
+    # fetch-index: 拉取大盘指数
+    p_findex = subparsers.add_parser('fetch-index',
+                                      help='拉取大盘指数数据 (ak.stock_zh_index_daily)')
+    p_findex.add_argument('symbols', nargs='+',
+                          help='指数代码（带sh/sz前缀），如 sh000300 sh000001')
+    p_findex.add_argument('--force', action='store_true',
+                          help='强制重新拉取，忽略缓存')
+
+    # indexes: 查看指数缓存
+    p_idx = subparsers.add_parser('indexes', help='查看已缓存的指数')
+
     args = parser.parse_args()
     manager = HistoricalDataManager()
 
@@ -561,6 +699,24 @@ def main():
                     if result.get('issues'):
                         print(f"  {sym}: {', '.join(result['issues'])}")
             print(f"\n有效: {valid}, 无效: {invalid}")
+
+    elif args.command == 'fetch-index':
+        for sym in args.symbols:
+            df = manager.fetch_index(sym, force=args.force)
+            print(f"  → {sym}: {len(df)} 行"
+                  + (f" ({df['日期'].iloc[0].date()} ~ {df['日期'].iloc[-1].date()})"
+                     if len(df) > 0 else ""))
+
+    elif args.command == 'indexes':
+        idx_meta = manager.metadata.get('indexes', {})
+        if not idx_meta:
+            print("暂无缓存指数，使用: python historical_data_manager.py fetch-index sh000300")
+        else:
+            print(f"\n已缓存 {len(idx_meta)} 个指数:")
+            for sym, info in sorted(idx_meta.items()):
+                print(f"  {sym:10s} {info['name']:8s}  "
+                      f"{info['row_count']:>6} 行  "
+                      f"{info['first_date']} ~ {info['last_date']}")
 
     else:
         parser.print_help()
