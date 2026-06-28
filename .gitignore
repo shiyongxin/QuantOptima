@@ -3,5 +3,7 @@ stock_data/
 *.pyc
 optimize_full.log
 fetch_*.log
+*.log
+.DS_Store
 .claude/
 optimization_package/
