@@ -82,7 +82,7 @@
 | 淘汰策略 | 放宽阈值重试（0.2 → 0.3 → 0.4） | 自动化 |
 | 跨 regime 边界窗口 | 丢弃 | 防 regime 混合 |
 
-### Phase 4 — Regime 防泄漏（P1）
+### Phase 4 — Regime 防泄漏 ✓ 完成
 
 | 决策项 | 决定 | 理由 |
 |---|---|---|
@@ -92,16 +92,22 @@
 | 辅助指标 | 保持简单（不加波动率/量能/宽度） | 加指标 → 维度增加 → regime 数据量更少 |
 | 跨 regime 边界窗口 | 丢弃 | 跟 E2/R5 一致 |
 
-### Phase 5 — Survivorship（P1）
+### Phase 5 — Survivorship（P1）✓ 完成
 
 | 决策项 | 决定 | 理由 |
 |---|---|---|
-| 数据源 | akshare `stock_zh_a_stop_em` + 手工 `delisted_symbols.csv` | 免费 + 可维护 |
+| 数据源 | akshare `stock_zh_a_stop_em` + `survivorship_report.py` | 免费 + 可维护 |
 | 残缺数据 | 截断到最后有效日期 | 实现简单 |
 | 权重 | 跟现存股票**等权** | 默认无偏 |
 | 报告 | 每次 run 自动生成 `survivorship_report.md` | 透明度 |
-| 优先级 | P1 | P0 之后做 |
-| 估算退市股 | ~500 只 | A 股 30 年估算 |
+| 估算退市股 | **2235 只**（已知覆盖：1942 现存 + 293 停牌） | A 股 30 年估算 |
+
+**实际结果（2026-06-27）**：
+- Universe：1942 只（2002-2026）
+- 停牌：293 只（akshare `stock_zh_a_stop_em`）
+- 全A覆盖：2235/5867（38.1%）
+- 估算 bias：2%/年，30 年累计 **≈80%**（复利）
+- 报告：`stock_data/survivorship_report.md`
 
 ### Meta 决策
 
