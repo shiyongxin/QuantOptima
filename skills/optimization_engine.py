@@ -112,24 +112,19 @@ class FitnessEvaluator:
 
     def evaluate(self, params: dict, stock_data: dict,
                  regime_labels: dict = None,
-                 target_regime: str = None) -> tuple:
+                 target_regime: str = None,
+                 train_window: int = 120,
+                 sub_window: int = 252,
+                 step: int = 63) -> tuple:
         """
-        评估一组参数在多只股票上的表现
+        评估一组参数在多只股票上的表现（Phase 3 修复版本）
 
-        Parameters:
-        -----------
-        params : dict
-            参数字典
-        stock_data : dict
-            {symbol: DataFrame} 股票数据
-        regime_labels : dict or None
-            {symbol: pd.Series} 每只股票的体制标签
-        target_regime : str or None
-            如果指定，仅评估该体制时段的数据
+        统一 walk-forward：
+        - train_window: warmup 长度（默认 120 = 全空间 ma_slow.high）
+        - sub_window: 测试子窗口长度（默认 252 = 一年）
+        - step: 步进（默认 63 = 季度）
 
-        Returns:
-        --------
-        (fitness: float, details: dict)
+        体制过滤时只在 regime 段内 walk-forward，自动避免跨边界窗口。
         """
         # GPU 加速路径
         if self.use_gpu and self.gpu_backtester and not target_regime:
@@ -137,30 +132,29 @@ class FitnessEvaluator:
                 return self.gpu_backtester.evaluate_params_batch(
                     stock_data, params, regime_labels, target_regime
                 )
-            except Exception as e:
-                # GPU 失败时回退到 CPU
+            except Exception:
                 pass
 
-        # CPU 路径 (原有逻辑)
         all_metrics = []
 
         for symbol, data in stock_data.items():
             try:
                 if target_regime and regime_labels and symbol in regime_labels:
-                    # 按体制过滤数据
                     labels = regime_labels[symbol]
-                    mask = labels == target_regime
-                    if mask.sum() < 60:
-                        continue
-                    # 使用连续的体制时段进行回测
-                    metrics_list = self._backtest_regime_windows(
-                        data, params, labels, target_regime
+                    metrics_list = self._walk_forward_by_regime(
+                        data, labels, target_regime, params,
+                        train_window=train_window,
+                        sub_window=sub_window,
+                        step=step,
                     )
                     all_metrics.extend(metrics_list)
                 else:
-                    # Walk-Forward回测
-                    metrics_list = self.backtester.walk_forward(
-                        data, params, train_days=504, test_days=180, step_days=63
+                    # 全量 walk-forward（统一路径，不再用 backtester.walk_forward）
+                    metrics_list = self._walk_forward(
+                        data, params,
+                        train_window=train_window,
+                        sub_window=sub_window,
+                        step=step,
                     )
                     all_metrics.extend(metrics_list)
             except Exception:
@@ -171,21 +165,126 @@ class FitnessEvaluator:
 
         return self._compute_fitness(all_metrics)
 
-    def _backtest_regime_windows(self, data, params, labels, target_regime):
+    def legacy_evaluate(self, params, stock_data, regime_labels=None, target_regime=None):
         """
-        在体制时段内进行回测
+        修复前的旧评估逻辑（M1 决策要求保留作对照）
 
-        混合策略:
-        - 长窗口体制(BULL/BEAR/SIDEWAYS): 按连续窗口切割回测
-        - 短窗口体制(CRASH/RECOVERY): 全量回测后按交易入口过滤
+        - train_days=504 仅作偏移量（不是真训练）
+        - test_days=180（半年）
+        - step_days=63
+        - regime 短窗口用 _backtest_by_trade_filter
         """
+        all_metrics = []
+        for symbol, data in stock_data.items():
+            try:
+                if target_regime and regime_labels and symbol in regime_labels:
+                    labels = regime_labels[symbol]
+                    mask = labels == target_regime
+                    if mask.sum() < 60:
+                        continue
+                    metrics_list = self._backtest_regime_windows_legacy(
+                        data, params, labels, target_regime
+                    )
+                    all_metrics.extend(metrics_list)
+                else:
+                    metrics_list = self.backtester.walk_forward(
+                        data, params, train_days=504, test_days=180, step_days=63
+                    )
+                    all_metrics.extend(metrics_list)
+            except Exception:
+                continue
+        if not all_metrics:
+            return 0.0, {}
+        return self._compute_fitness_legacy(all_metrics)
+
+    def _walk_forward(self, data, params, train_window=120, sub_window=252, step=63):
+        """
+        单只股票的 walk-forward（Phase 3 统一路径）
+
+        - 跳过前 train_window 天（warmup）
+        - 从 train_window 起，每 step 天取 sub_window 长度的测试窗口
+        - 窗口不足 sub_window 长度时停止
+        """
+        if len(data) < train_window + sub_window:
+            return []
         metrics_list = []
+        idx = train_window
+        while idx + sub_window <= len(data):
+            test_data = data.iloc[idx:idx + sub_window]
+            try:
+                metrics = self.backtester.backtest(test_data, params)
+                if metrics.num_trades > 0:
+                    metrics_list.append(metrics)
+            except Exception:
+                pass
+            idx += step
+        return metrics_list
 
-        # 找出连续的体制时段
+    def _walk_forward_by_regime(self, data, labels, target_regime, params,
+                                train_window=120, sub_window=252, step=63):
+        """
+        在体制时段内做 walk-forward（Phase 3 R5 决策）
+
+        - 找出 target_regime 的连续段
+        - 段长 < sub_window → 跳过（窗口都凑不出来一个）
+        - 段内 walk-forward，子窗口 = sub_window
+        - 因为在段内做 walk-forward，窗口不会跨 regime 边界（R5 决策）
+        """
+        in_regime = (labels == target_regime).reset_index(drop=True)
+        n = len(in_regime)
+        if n < sub_window:
+            return []
+
+        # 找连续段
+        segments = []  # list of (start, end)
+        start = None
+        for i in range(n):
+            if in_regime.iloc[i]:
+                if start is None:
+                    start = i
+            else:
+                if start is not None:
+                    if i - start >= sub_window:
+                        segments.append((start, i))
+                    start = None
+        if start is not None and n - start >= sub_window:
+            segments.append((start, n))
+
+        if not segments:
+            return []
+
+        # 段内 walk-forward
+        metrics_list = []
+        for seg_start, seg_end in segments:
+            seg_data = data.iloc[seg_start:seg_end].reset_index(drop=True)
+            if len(seg_data) < train_window + sub_window:
+                # 段太短，跳过 warmup 后直接 backtest 整个段
+                try:
+                    metrics = self.backtester.backtest(seg_data, params)
+                    if metrics.num_trades > 0:
+                        metrics_list.append(metrics)
+                except Exception:
+                    pass
+                continue
+            # 在段内做 walk-forward
+            idx = train_window
+            while idx + sub_window <= len(seg_data):
+                test_data = seg_data.iloc[idx:idx + sub_window]
+                try:
+                    metrics = self.backtester.backtest(test_data, params)
+                    if metrics.num_trades > 0:
+                        metrics_list.append(metrics)
+                except Exception:
+                    pass
+                idx += step
+        return metrics_list
+
+    def _backtest_regime_windows_legacy(self, data, params, labels, target_regime):
+        """修复前的 regime 窗口回测（保留用于 M1 对照）"""
+        metrics_list = []
         in_regime = labels == target_regime
         regime_total_days = in_regime.sum()
 
-        # 找出最长连续天数
         max_consec = 0
         cur = 0
         for v in in_regime:
@@ -195,11 +294,9 @@ class FitnessEvaluator:
             else:
                 cur = 0
 
-        # 短窗口体制: 全量回测 + 交易入口过滤
         if max_consec < 15 or regime_total_days < 60:
             return self._backtest_by_trade_filter(data, params, labels, target_regime)
 
-        # 长窗口体制: 按连续窗口切割
         starts = []
         for i in range(len(in_regime)):
             if in_regime.iloc[i] and (i == 0 or not in_regime.iloc[i-1]):
@@ -209,133 +306,93 @@ class FitnessEvaluator:
             end = start
             while end < len(in_regime) and in_regime.iloc[end]:
                 end += 1
-
             if end - start < 15:
                 continue
-
             window_data = data.iloc[start:end]
             if len(window_data) < 15:
                 continue
-
             try:
                 metrics = self.backtester.backtest(window_data, params)
                 if metrics.num_trades > 0:
                     metrics_list.append(metrics)
             except Exception:
                 continue
-
         return metrics_list
 
     def _backtest_by_trade_filter(self, data, params, labels, target_regime):
-        """
-        全量回测 + 按交易入口体制过滤
-
-        适用于短窗口体制(CRASH/RECOVERY):
-        1. 对整只股票做回测，获取每笔交易的入场日期
-        2. 检查入场日的体制标签
-        3. 仅保留入场时处于目标体制的交易
-        4. 用过滤后的交易计算指标
-        """
+        """保留的旧 regime 短窗口处理逻辑（用于 legacy_evaluate）"""
         try:
-            metrics, trade_details = self.backtester.backtest_with_details(data, params)
+            metrics, trade_details = self.backtester.backtest_with_details(data, params, legacy=True)
         except Exception:
             return []
-
         if not trade_details:
             return []
-
-        # 按入口过滤交易
         filtered_trades = []
         for td in trade_details:
             if td.entry_idx < len(labels):
                 entry_regime = labels.iloc[td.entry_idx]
                 if entry_regime == target_regime:
                     filtered_trades.append(td)
-
         if not filtered_trades:
             return []
-
-        # 从过滤后的交易计算指标
         filtered_metrics = self._compute_metrics_from_trades(filtered_trades, data, params)
         if filtered_metrics and filtered_metrics.num_trades > 0:
             return [filtered_metrics]
         return []
 
     def _compute_metrics_from_trades(self, trades, data, params):
-        """从交易列表计算BacktestMetrics"""
-        import numpy as np
-
+        """保留的旧交易聚合逻辑（仅 legacy_evaluate 用）"""
         if not trades:
             return None
-
         pnl_arr = np.array([t.pnl_pct for t in trades], dtype=np.float64)
         holding_arr = np.array([t.holding_days for t in trades], dtype=np.float64)
         position_size_pct = float(params.get('position_size_pct', 0.8))
-
-        # 胜率
         wins = pnl_arr[pnl_arr > 0]
         losses = pnl_arr[pnl_arr <= 0]
         win_rate = (len(wins) / len(pnl_arr)) * 100 if len(pnl_arr) > 0 else 0
-
-        # 盈亏比
         avg_win = np.mean(wins) if len(wins) > 0 else 0
         avg_loss = abs(np.mean(losses)) if len(losses) > 0 else 1
         profit_factor = avg_win / avg_loss if avg_loss > 0 else 0
-
-        # 总收益(复利)
         cumulative = np.cumprod(1 + pnl_arr / 100 * position_size_pct)
         total_return = (cumulative[-1] - 1) * 100 if len(cumulative) > 0 else 0
-
-        # 年化收益
-        total_days = data.iloc[-1]['收盘']  # placeholder
         total_days = len(data)
         years = total_days / 252
-        if years > 0 and cumulative[-1] > 0:
-            annualized_return = (cumulative[-1] ** (1 / years) - 1) * 100
-        else:
-            annualized_return = 0
-
-        # 最大回撤
+        annualized_return = (cumulative[-1] ** (1 / years) - 1) * 100 if years > 0 and cumulative[-1] > 0 else 0
         equity = np.concatenate([[1.0], cumulative])
         peak = np.maximum.accumulate(equity)
         drawdown = (equity - peak) / peak * 100
         max_drawdown = abs(drawdown.min()) if len(drawdown) > 0 else 0
-
-        # 夏普比率
+        sharpe = 0
         if len(pnl_arr) > 1:
             daily_returns = pnl_arr / 100
             avg_ret = np.mean(daily_returns) * 252 / np.mean(holding_arr) if np.mean(holding_arr) > 0 else 0
             std_ret = np.std(daily_returns) * np.sqrt(252 / np.mean(holding_arr)) if np.mean(holding_arr) > 0 else 1
             sharpe = (avg_ret - 0.03) / std_ret if std_ret > 0 else 0
-        else:
-            sharpe = 0
-
-        # 最大连续亏损
         is_loss = pnl_arr <= 0
         max_consec = 0
         if np.any(is_loss):
             loss_streaks = np.diff(np.where(np.concatenate([[False], is_loss, [False]]))[0])
             max_consec = int(loss_streaks.max()) if len(loss_streaks) > 0 else 0
-
         from vectorized_backtest import BacktestMetrics
         return BacktestMetrics(
-            total_return=float(total_return),
-            annualized_return=float(annualized_return),
-            max_drawdown=float(max_drawdown),
-            sharpe_ratio=float(sharpe),
-            win_rate=float(win_rate),
-            profit_factor=float(profit_factor),
-            num_trades=len(pnl_arr),
-            avg_holding_days=float(np.mean(holding_arr)),
-            avg_return_per_trade=float(np.mean(pnl_arr)),
-            max_consecutive_losses=max_consec
+            total_return=float(total_return), annualized_return=float(annualized_return),
+            max_drawdown=float(max_drawdown), sharpe_ratio=float(sharpe),
+            win_rate=float(win_rate), profit_factor=float(profit_factor),
+            num_trades=len(pnl_arr), avg_holding_days=float(np.mean(holding_arr)),
+            avg_return_per_trade=float(np.mean(pnl_arr)), max_consecutive_losses=max_consec,
         )
 
     def _compute_fitness(self, metrics_list: list) -> tuple:
         """
-        从回测指标列表计算适应度
+        从回测指标列表计算适应度（Phase 3 修复版，混合聚合）
 
-        适应度 = 0.40*达标率 + 0.25*中位收益 + 0.20*中位夏普 + 0.15*回撤惩罚
+        聚合策略（FIX_PLAN E4）：
+        - target_rate: keep as ratio
+        - return: mean
+        - sharpe: median
+        - drawdown: median
+
+        fitness = 0.40 * target_rate + 0.25 * ret + 0.20 * sharpe + 0.15 * dd_penalty
         """
         returns = [m.total_return for m in metrics_list]
         sharpes = [m.sharpe_ratio for m in metrics_list]
@@ -344,23 +401,22 @@ class FitnessEvaluator:
         trades = [m.num_trades for m in metrics_list]
         holding_days = [m.avg_holding_days for m in metrics_list]
 
-        # 达标率: 收益>target_return的比例
+        # 达标率: 收益>target_return 的比例
         target_met = sum(1 for r in returns if r >= self.target_return)
         target_rate = target_met / len(returns) if returns else 0
 
-        # 中位收益率 (归一化到0-1)
-        median_ret = np.median(returns) if returns else 0
-        ret_score = min(max(median_ret / 50, -1), 1)  # 50%收益得满分
+        # E4: return 改用 mean（让牛市大赚能反映）
+        mean_ret = np.mean(returns) if returns else 0
+        ret_score = min(max(mean_ret / 50, -1), 1)
 
-        # 中位夏普 (归一化到0-1)
+        # E4: sharpe 保留 median
         median_sharpe = np.median(sharpes) if sharpes else 0
-        sharpe_score = min(max(median_sharpe / 2, -1), 1)  # 夏普2得满分
+        sharpe_score = min(max(median_sharpe / 2, -1), 1)
 
-        # 回撤惩罚 (越小越好)
+        # E4: drawdown 保留 median
         median_dd = np.median(drawdowns) if drawdowns else 100
         dd_penalty = max(0, 1 - median_dd / self.max_drawdown_limit)
 
-        # 交易次数惩罚 (太少或太多都不好)
         avg_trades = np.mean(trades) if trades else 0
         if avg_trades < 3:
             trade_penalty = avg_trades / 3
@@ -369,7 +425,6 @@ class FitnessEvaluator:
         else:
             trade_penalty = 1.0
 
-        # 综合适应度
         fitness = (
             0.40 * target_rate +
             0.25 * max(0, ret_score) +
@@ -379,15 +434,52 @@ class FitnessEvaluator:
 
         details = {
             'target_rate': target_rate,
-            'median_return': median_ret,
-            'median_sharpe': median_sharpe,
-            'median_drawdown': median_dd,
+            'mean_return': float(mean_ret),
+            'median_return': float(np.median(returns)) if returns else 0,
+            'median_sharpe': float(median_sharpe),
+            'median_drawdown': float(median_dd),
+            'avg_trades': float(avg_trades),
+            'avg_holding_days': float(np.mean(holding_days)) if holding_days else 0,
+            'sample_count': len(metrics_list),
+            'win_rate': float(np.mean(win_rates)) if win_rates else 0,
+        }
+        return fitness, details
+
+    def _compute_fitness_legacy(self, metrics_list):
+        """保留的旧 fitness 公式（用于 legacy_evaluate）"""
+        returns = [m.total_return for m in metrics_list]
+        sharpes = [m.sharpe_ratio for m in metrics_list]
+        drawdowns = [m.max_drawdown for m in metrics_list]
+        win_rates = [m.win_rate for m in metrics_list]
+        trades = [m.num_trades for m in metrics_list]
+        holding_days = [m.avg_holding_days for m in metrics_list]
+        target_met = sum(1 for r in returns if r >= self.target_return)
+        target_rate = target_met / len(returns) if returns else 0
+        median_ret = np.median(returns) if returns else 0
+        ret_score = min(max(median_ret / 50, -1), 1)
+        median_sharpe = np.median(sharpes) if sharpes else 0
+        sharpe_score = min(max(median_sharpe / 2, -1), 1)
+        median_dd = np.median(drawdowns) if drawdowns else 100
+        dd_penalty = max(0, 1 - median_dd / self.max_drawdown_limit)
+        avg_trades = np.mean(trades) if trades else 0
+        if avg_trades < 3:
+            trade_penalty = avg_trades / 3
+        elif avg_trades > 50:
+            trade_penalty = max(0, 1 - (avg_trades - 50) / 50)
+        else:
+            trade_penalty = 1.0
+        fitness = (
+            0.40 * target_rate + 0.25 * max(0, ret_score) +
+            0.20 * max(0, sharpe_score) + 0.15 * dd_penalty
+        ) * trade_penalty
+        details = {
+            'target_rate': target_rate, 'median_return': median_ret,
+            'median_sharpe': median_sharpe, 'median_drawdown': median_dd,
             'avg_trades': avg_trades,
             'avg_holding_days': np.mean(holding_days) if holding_days else 0,
             'sample_count': len(metrics_list),
             'win_rate': np.mean(win_rates) if win_rates else 0,
         }
-
         return fitness, details
 
 
@@ -618,28 +710,38 @@ class OptimizationEngine:
             是否使用 GPU 加速
         """
         self.use_gpu = use_gpu and GPU_AVAILABLE
+        self.data_dir = data_dir
         self.data_manager = HistoricalDataManager(data_dir)
         self.backtester = VectorizedBacktester()
         self.evaluator = FitnessEvaluator(self.backtester, use_gpu=self.use_gpu)
         self.n_workers = n_workers
 
         self.results = {}       # {regime: OptimizationResult}
-        self.stock_data = {}    # {symbol: DataFrame}
-        self.regime_labels = {} # {symbol: pd.Series}
+        self.stock_data = {}    # {symbol: DataFrame} (all)
+        self.regime_labels = {} # {symbol: pd.Series} (all)
+        # Phase 3: split-based views（按 train/val/test 过滤后的子集）
+        self.splits = {
+            'train': {'symbols': set(), 'regimes': None},
+            'val':   {'symbols': set(), 'regimes': None},
+            'test':  {'symbols': set(), 'regimes': None},
+        }
 
-    def load_data(self, symbols=None, min_history_days=5000,
-                  regime_labels_file=None):
+    def load_data(self, symbols=None, min_history_days=180,
+                  regime_labels_file=None, splits_dir=None):
         """
-        加载股票数据和体制标签
+        加载股票数据和体制标签（Phase 3：支持 train/val/test 切分）
 
-        Parameters:
-        -----------
+        Parameters
+        ----------
         symbols : list or None
-            股票代码列表，None则使用股票池
+            股票代码列表；None 则使用股票池
         min_history_days : int
-            最少历史天数
+            最少历史天数（Phase 3 调整：180 = train_window 120 + 最小 test 60）
         regime_labels_file : str or None
-            体制标签文件路径
+            体制标签文件路径（推荐：data_dir/regime_labels.csv）
+        splits_dir : str or None
+            切分文件目录（含 train/val/test_symbols.txt + regime_labels_*.csv）
+            如果提供，会进一步按 split 加载
         """
         # 加载体制标签
         if regime_labels_file and Path(regime_labels_file).exists():
@@ -654,7 +756,7 @@ class OptimizationEngine:
         # 获取股票池
         if symbols is None:
             symbols = self.data_manager.get_universe(
-                min_history_days=min_history_days, min_rows=2000
+                min_history_days=min_history_days, min_rows=200
             )
 
         if not symbols:
@@ -666,15 +768,65 @@ class OptimizationEngine:
         loaded = 0
         for sym in symbols:
             data = self.data_manager.load(sym)
-            if len(data) >= 252:  # 至少1年数据
+            if len(data) >= 252:
                 self.stock_data[sym] = data
                 loaded += 1
-
-                # 为每只股票分配体制标签
                 if self._index_regime_labels is not None:
                     self._assign_regime_labels(sym, data)
 
         print(f"[OK] 成功加载 {loaded} 只股票")
+
+        # Phase 3: 加载 splits
+        if splits_dir:
+            self._load_splits(splits_dir)
+
+    def _load_splits(self, splits_dir):
+        """
+        加载 train/val/test splits（来自 data_splitter.py 输出）
+
+        文件格式：
+        - splits/train_symbols.txt
+        - splits/val_symbols.txt
+        - splits/test_symbols.txt
+        - regime_labels_train.csv
+        - regime_labels_val.csv
+        - regime_labels_test.csv
+        """
+        splits_path = Path(splits_dir) if not Path(splits_dir).is_absolute() else Path(splits_dir)
+        # 也支持 data_dir 下的 splits/ 子目录
+        if not splits_path.exists():
+            alt = Path(self.data_dir) / 'splits'
+            if alt.exists():
+                splits_path = alt
+
+        if not splits_path.exists():
+            print(f"[WARN] splits 目录不存在: {splits_dir}")
+            return
+
+        for split_name in ['train', 'val', 'test']:
+            sym_file = splits_path / f'{split_name}_symbols.txt'
+            if not sym_file.exists():
+                print(f"[WARN] 缺 {sym_file}")
+                continue
+            with open(sym_file, 'r', encoding='utf-8') as f:
+                syms = set(line.strip() for line in f if line.strip())
+            # 过滤实际有数据的股票
+            actual_syms = syms & set(self.stock_data.keys())
+            self.splits[split_name]['symbols'] = actual_syms
+            print(f"[OK] {split_name}: {len(actual_syms)} 只股票 (来自 {sym_file.name})")
+
+    def _get_split_data(self, split: str) -> tuple:
+        """
+        返回 (split_stock_data, split_regime_labels)
+
+        如果 split 对应的 symbols 为空（splits 未加载），返回全集（兼容旧 API）
+        """
+        syms = self.splits.get(split, {}).get('symbols', set()) if self.splits else set()
+        if not syms:
+            return self.stock_data, self.regime_labels
+        sub_data = {s: self.stock_data[s] for s in syms if s in self.stock_data}
+        sub_labels = {s: self.regime_labels[s] for s in syms if s in self.regime_labels}
+        return sub_data, sub_labels
 
     def _assign_regime_labels(self, symbol, data):
         """为股票数据分配体制标签(基于指数日期对齐) - 向量化版本"""
@@ -701,36 +853,35 @@ class OptimizationEngine:
         self.regime_labels[symbol] = merged['regime'].fillna('SIDEWAYS')
 
     def optimize_global(self, stock_sample=None, n_stocks=50,
-                        ga_params=None, verbose=True) -> OptimizationResult:
+                        ga_params=None, verbose=True, split='train') -> OptimizationResult:
         """
-        阶段1: 全局优化
+        阶段1: 全局优化（Phase 3: 默认在 train split 上跑）
 
-        在所有体制数据上优化，产出一套通用参数作为基线。
-
-        Parameters:
-        -----------
+        Parameters
+        ----------
         stock_sample : list or None
-            指定股票子集，None则随机抽样
+            指定股票子集；None 则随机抽样
         n_stocks : int
             抽样股票数
         ga_params : dict or None
-            GA参数覆盖
+            GA 参数覆盖
         verbose : bool
             是否打印进度
+        split : str
+            'train'（默认）/ 'val' / 'test' / 'all'。GA 永远只看 train
         """
         print("\n" + "=" * 70)
-        print("  阶段1: 全局优化 (Global Optimization)")
+        print(f"  阶段1: 全局优化 (Global Optimization, split={split})")
         print("=" * 70)
 
-        # 抽样股票
-        sample_data = self._get_sample(stock_sample, n_stocks)
+        # 抽样股票（从 split 子集里）
+        sample_data = self._get_sample(stock_sample, n_stocks, split=split)
         if not sample_data:
             print("[ERROR] 无可用股票数据")
             return None
 
         print(f"  样本股票: {len(sample_data)} 只")
 
-        # GA配置
         ga_cfg = {
             'population_size': 80,
             'max_generations': 40,
@@ -739,11 +890,9 @@ class OptimizationEngine:
         if ga_params:
             ga_cfg.update(ga_params)
 
-        # 评估函数
         def evaluate(params):
             return self.evaluator.evaluate(params, sample_data)
 
-        # 运行GA
         ga = GeneticAlgorithm(**ga_cfg)
         start_time = time.time()
 
@@ -753,7 +902,6 @@ class OptimizationEngine:
             if self.use_gpu:
                 print(f"  GPU 加速: 启用")
 
-        # GPU 批量评估模式
         gpu_bt = self.evaluator.gpu_backtester if self.use_gpu else None
 
         best, all_inds, conv_gen = ga.run(
@@ -762,16 +910,15 @@ class OptimizationEngine:
         )
         total_time = time.time() - start_time
 
-        # 构建结果
         system = IndicatorSystem(
             name="通用基线型",
-            description="在所有市场体制下表现均衡的通用参数",
+            description=f"在所有市场体制下表现均衡的通用参数（{split} split）",
             applicable_regimes=['BULL', 'BEAR', 'SIDEWAYS', 'CRASH', 'RECOVERY'],
             params=best.params,
             fitness_scores={'GLOBAL': best.fitness},
             confidence=0.7,
             sample_count=best.fitness_details.get('sample_count', 0),
-            median_return=best.fitness_details.get('median_return', 0),
+            median_return=best.fitness_details.get('mean_return', 0),  # Phase 3 改用 mean
             win_rate_above_10pct=best.fitness_details.get('target_rate', 0),
             median_sharpe=best.fitness_details.get('median_sharpe', 0),
             median_max_drawdown=best.fitness_details.get('median_drawdown', 0),
@@ -797,33 +944,26 @@ class OptimizationEngine:
         return result
 
     def optimize_by_regime(self, stock_sample=None, n_stocks=50,
-                           ga_params=None, verbose=True) -> dict:
+                           ga_params=None, verbose=True, split='train') -> dict:
         """
-        阶段2: 按体制分别优化
-
-        对每种体制分别优化，产出每种体制的最优参数集。
-
-        Returns:
-        --------
-        dict : {regime_name: OptimizationResult}
+        阶段2: 按体制分别优化（Phase 3: 分桶，默认在 train split 上跑）
         """
         print("\n" + "=" * 70)
-        print("  阶段2: 按体制分别优化 (Per-Regime Optimization)")
+        print(f"  阶段2: 按体制分别优化 (Per-Regime, split={split})")
         print("=" * 70)
 
         if not self.regime_labels:
             print("[ERROR] 无体制标签，请先加载体制标签文件")
             return {}
 
-        sample_data = self._get_sample(stock_sample, n_stocks)
+        sample_data = self._get_sample(stock_sample, n_stocks, split=split)
         if not sample_data:
             return {}
 
         # 找出数据量足够多的体制
         regime_counts = {}
-        for sym, labels in self.regime_labels.items():
-            if sym not in sample_data:
-                continue
+        sample_labels = {s: self.regime_labels[s] for s in sample_data if s in self.regime_labels}
+        for sym, labels in sample_labels.items():
             for regime in labels.unique():
                 count = (labels == regime).sum()
                 regime_counts[regime] = regime_counts.get(regime, 0) + count
@@ -853,7 +993,7 @@ class OptimizationEngine:
 
             def evaluate(params, r=regime):
                 return self.evaluator.evaluate(
-                    params, sample_data, self.regime_labels, r
+                    params, sample_data, sample_labels, r
                 )
 
             ga = GeneticAlgorithm(**ga_cfg)
@@ -864,13 +1004,13 @@ class OptimizationEngine:
 
             system = IndicatorSystem(
                 name=f"{regime_name_cn}专用型",
-                description=f"专为{regime_name_cn}市场体制优化的参数",
+                description=f"专为{regime_name_cn}市场体制优化的参数（{split} split）",
                 applicable_regimes=[regime],
                 params=best.params,
                 fitness_scores={regime: best.fitness},
                 confidence=min(0.9, best.fitness * 1.2),
                 sample_count=best.fitness_details.get('sample_count', 0),
-                median_return=best.fitness_details.get('median_return', 0),
+                median_return=best.fitness_details.get('mean_return', 0),
                 win_rate_above_10pct=best.fitness_details.get('target_rate', 0),
                 median_sharpe=best.fitness_details.get('median_sharpe', 0),
                 median_max_drawdown=best.fitness_details.get('median_drawdown', 0),
@@ -897,29 +1037,29 @@ class OptimizationEngine:
         return results
 
     def optimize_robust(self, stock_sample=None, n_stocks=50,
-                        ga_params=None, verbose=True) -> OptimizationResult:
+                        ga_params=None, verbose=True, split='train') -> OptimizationResult:
         """
-        阶段3: 混合策略优化
+        阶段3: 稳健策略优化（Phase 3: 默认在 train split 上跑）
 
-        优化目标: 在所有体制下都不差，而非在某一体制下最优。
-        适应度 = min(各体制fitness)
+        适应度 = 0.7 * min(各体制 fitness) + 0.3 * avg(各体制 fitness)
         """
         print("\n" + "=" * 70)
-        print("  阶段3: 稳健策略优化 (Robust Optimization)")
+        print(f"  阶段3: 稳健策略优化 (Robust, split={split})")
         print("=" * 70)
 
-        sample_data = self._get_sample(stock_sample, n_stocks)
+        sample_data = self._get_sample(stock_sample, n_stocks, split=split)
         if not sample_data:
             return None
 
-        # 确定有哪些体制
         if self.regime_labels:
             all_regimes = set()
-            for labels in self.regime_labels.values():
+            sample_labels = {s: self.regime_labels[s] for s in sample_data if s in self.regime_labels}
+            for labels in sample_labels.values():
                 all_regimes.update(labels.unique())
             all_regimes = sorted(all_regimes)
         else:
             all_regimes = []
+            sample_labels = {}
 
         print(f"  样本股票: {len(sample_data)} 只")
         print(f"  体制: {all_regimes}")
@@ -933,27 +1073,23 @@ class OptimizationEngine:
             ga_cfg.update(ga_params)
 
         def evaluate_robust(params):
-            """稳健适应度: 各体制fitness的最小值(忽略无数据体制)"""
-            if not all_regimes or not self.regime_labels:
+            if not all_regimes or not sample_labels:
                 return self.evaluator.evaluate(params, sample_data)
 
             regime_fitnesses = {}
             for regime in all_regimes:
                 fitness, details = self.evaluator.evaluate(
-                    params, sample_data, self.regime_labels, regime
+                    params, sample_data, sample_labels, regime
                 )
-                # 仅记录有样本的体制
                 if details.get('sample_count', 0) > 0:
                     regime_fitnesses[regime] = fitness
 
             if not regime_fitnesses:
                 return 0.0, {}
 
-            # 稳健适应度 = 最小fitness (最大化最差表现)
             fitness_values = list(regime_fitnesses.values())
             min_fitness = min(fitness_values)
             avg_fitness = np.mean(fitness_values)
-            # 70%最小 + 30%平均
             robust_fitness = 0.7 * min_fitness + 0.3 * avg_fitness
 
             details = {
@@ -967,7 +1103,6 @@ class OptimizationEngine:
 
         ga = GeneticAlgorithm(**ga_cfg)
         start_time = time.time()
-
         best, all_inds, conv_gen = ga.run(evaluate_robust, verbose=verbose)
         total_time = time.time() - start_time
 
@@ -982,13 +1117,13 @@ class OptimizationEngine:
 
         system = IndicatorSystem(
             name="通用稳健型",
-            description="在所有市场体制下都不差的稳健参数，适合不确定市场方向时使用",
+            description=f"在所有市场体制下都不差的稳健参数（{split} split）",
             applicable_regimes=regimes_used if regimes_used else all_regimes,
             params=best.params,
             fitness_scores=regime_scores,
             confidence=0.6,
             sample_count=best.fitness_details.get('sample_count', 0),
-            median_return=best.fitness_details.get('median_return', 0),
+            median_return=best.fitness_details.get('mean_return', 0),
             win_rate_above_10pct=best.fitness_details.get('target_rate', 0),
             median_sharpe=best.fitness_details.get('median_sharpe', 0),
             median_max_drawdown=best.fitness_details.get('median_drawdown', 0),
@@ -1005,28 +1140,25 @@ class OptimizationEngine:
             total_time_sec=total_time,
             convergence_gen=conv_gen,
         )
-
         self.results['ROBUST'] = result
-
         if verbose:
             self._print_result_summary(result)
-
         return result
 
     def iterative_optimize(self, stock_sample=None, n_stocks=50,
-                           n_rounds=3, verbose=True) -> list:
+                           n_rounds=3, verbose=True, split='train') -> list:
         """
-        多轮迭代优化
+        多轮迭代优化（Phase 3: 默认在 train split 上跑）
 
-        Round 1: 粗粒度搜索 (大参数步长，小种群) → 缩小搜索空间
-        Round 2: 中粒度搜索 (中等步长，中种群) → 精炼参数范围
-        Round 3: 细粒度搜索 (小步长，大种群) → 精确参数
+        Round 1: 粗粒度 (大参数步长，小种群)
+        Round 2: 中粒度
+        Round 3: 细粒度 (小步长，大种群)
         """
         print("\n" + "=" * 70)
-        print(f"  多轮迭代优化 ({n_rounds} 轮)")
+        print(f"  多轮迭代优化 ({n_rounds} 轮, split={split})")
         print("=" * 70)
 
-        sample_data = self._get_sample(stock_sample, n_stocks)
+        sample_data = self._get_sample(stock_sample, n_stocks, split=split)
         if not sample_data:
             return []
 
@@ -1120,19 +1252,40 @@ class OptimizationEngine:
 
         return all_round_results
 
-    def _get_sample(self, stock_sample, n_stocks):
-        """获取股票样本"""
-        if stock_sample:
-            return {s: self.stock_data[s] for s in stock_sample if s in self.stock_data}
+    def _get_sample(self, stock_sample, n_stocks, split='train'):
+        """
+        获取股票样本（Phase 3: 默认从 train split 抽样）
 
-        if not self.stock_data:
+        Parameters
+        ----------
+        stock_sample : list or None
+            显式指定股票子集
+        n_stocks : int
+            抽样股票数
+        split : str
+            'train' / 'val' / 'test' / 'all'
+        """
+        # 先按 split 过滤 stock_data
+        if split != 'all':
+            split_syms = self.splits.get(split, {}).get('symbols', set())
+            if not split_syms:
+                # splits 未加载，fallback 到全集
+                pool = dict(self.stock_data)
+            else:
+                pool = {s: self.stock_data[s] for s in split_syms if s in self.stock_data}
+        else:
+            pool = dict(self.stock_data)
+
+        if stock_sample:
+            return {s: pool[s] for s in stock_sample if s in pool}
+
+        if not pool:
             return {}
 
-        all_symbols = list(self.stock_data.keys())
+        all_symbols = list(pool.keys())
         if len(all_symbols) <= n_stocks:
-            return dict(self.stock_data)
+            return pool
 
-        # 分层抽样: 优先选择有体制标签的
         import random
         labeled = [s for s in all_symbols if s in self.regime_labels]
         unlabeled = [s for s in all_symbols if s not in self.regime_labels]
@@ -1146,7 +1299,7 @@ class OptimizationEngine:
         if n_unlabeled > 0 and unlabeled:
             sample.extend(random.sample(unlabeled, min(n_unlabeled, len(unlabeled))))
 
-        return {s: self.stock_data[s] for s in sample}
+        return {s: pool[s] for s in sample}
 
     def _print_result_summary(self, result):
         """打印优化结果摘要"""
@@ -1161,6 +1314,167 @@ class OptimizationEngine:
         print(f"  平均持有天数: {system.median_holding_days:.0f}")
         print(f"  收敛代数: {result.convergence_gen}")
         print(f"  耗时: {result.total_time_sec:.1f}s")
+
+    # ======================================================================
+    #   Phase 3 新增：selection-on-val + test-once
+    # ======================================================================
+
+    def selection_on_val(self, top_k: int = 10,
+                         overfit_thresholds: list = None) -> dict:
+        """
+        在 val split 上对 GA-on-train 产出的 TOP-K 个体做 selection
+
+        Parameters
+        ----------
+        top_k : int
+            取 train GA 排名前 K 个个体
+        overfit_thresholds : list[float] or None
+            overfit_gap 阈值序列；默认 [0.2, 0.3, 0.4]（逐步放宽）
+
+        Returns
+        -------
+        dict: {regime_name: {'best_individual', 'best_fitness', 'val_fitness',
+                              'train_fitness', 'overfit_gap', 'all_evaluated'}}
+        """
+        if overfit_thresholds is None:
+            overfit_thresholds = [0.2, 0.3, 0.4]
+
+        print("\n" + "=" * 70)
+        print(f"  Selection on Val (top_k={top_k}, overfit_gap thresholds={overfit_thresholds})")
+        print("=" * 70)
+
+        val_data, val_labels = self._get_split_data('val')
+        if not val_data:
+            print("[ERROR] val split 为空")
+            return {}
+
+        results = {}
+        # 对每个已训练的 regime 做 selection
+        for regime_name, opt_result in self.results.items():
+            print(f"\n--- Selection for {regime_name} ---")
+
+            # 找到这个 regime 的 GA 所有个体（按 train fitness 排序后取 top_k）
+            # 简单实现：用 best_individual 作为代表，评估其在 val 上的表现
+            # 更完整的实现：让 GA 返回所有个体，这里只取 best
+            train_fitness = opt_result.best_individual.fitness
+            best_params = opt_result.best_individual.params
+
+            # 评估 val
+            target_regime = regime_name if regime_name not in ('GLOBAL', 'ROBUST', 'ITERATIVE') else None
+            val_fitness, val_details = self.evaluator.evaluate(
+                best_params, val_data, val_labels, target_regime
+            )
+
+            overfit_gap = max(0, train_fitness - val_fitness)
+
+            # 阈值过滤
+            accepted = None
+            for thr in overfit_thresholds:
+                if overfit_gap <= thr:
+                    accepted = thr
+                    break
+
+            if accepted is not None:
+                print(f"  ✓ 通过阈值 {accepted} (gap={overfit_gap:.4f})")
+                print(f"    train_f={train_fitness:.4f}, val_f={val_fitness:.4f}")
+            else:
+                print(f"  ✗ 所有阈值都未通过 (gap={overfit_gap:.4f})")
+                print(f"    train_f={train_fitness:.4f}, val_f={val_fitness:.4f}")
+
+            results[regime_name] = {
+                'best_individual': opt_result.best_individual,
+                'train_fitness': train_fitness,
+                'val_fitness': val_fitness,
+                'overfit_gap': overfit_gap,
+                'accepted_threshold': accepted,
+                'val_details': val_details,
+            }
+
+        return results
+
+    def test_once(self, system_or_params, regime: str = None) -> dict:
+        """
+        在 test split 上对单个策略做一次性评估
+
+        Parameters
+        ----------
+        system_or_params : IndicatorSystem or dict
+            指标体系或直接传参数字典
+        regime : str or None
+            对 regime-specific 策略，指定体制以正确过滤
+
+        Returns
+        -------
+        dict: test split 上的 fitness + details
+        """
+        test_data, test_labels = self._get_split_data('test')
+        if not test_data:
+            print("[ERROR] test split 为空")
+            return {}
+
+        if hasattr(system_or_params, 'params'):
+            params = system_or_params.params
+            target_regime = (system_or_params.applicable_regimes[0]
+                             if regime is None and len(system_or_params.applicable_regimes) == 1
+                             else regime)
+        else:
+            params = system_or_params
+            target_regime = regime
+
+        print(f"\n  [test-once] 评估 {'regime=' + str(target_regime) if target_regime else 'global'}")
+        fitness, details = self.evaluator.evaluate(
+            params, test_data, test_labels, target_regime
+        )
+        print(f"  test_fitness: {fitness:.4f}")
+        if 'mean_return' in details:
+            print(f"  mean_return:  {details['mean_return']:.2f}%")
+        if 'median_sharpe' in details:
+            print(f"  median_sharpe: {details['median_sharpe']:.3f}")
+        if 'median_drawdown' in details:
+            print(f"  median_drawdown: {details['median_drawdown']:.2f}%")
+
+        return {
+            'fitness': fitness,
+            'details': details,
+            'test_fitness': fitness,
+        }
+
+    def run_full_pipeline(self, n_stocks: int = 50,
+                          ga_params: dict = None) -> dict:
+        """
+        完整流程：GA-on-train → selection-on-val → test-once
+
+        Returns
+        -------
+        dict: 各阶段的完整结果
+        """
+        print("\n" + "#" * 70)
+        print("#  Phase 3 完整流程: train → val → test")
+        print("#" * 70)
+
+        # 1. GA on train
+        self.optimize_global(n_stocks=n_stocks, ga_params=ga_params, split='train')
+
+        # 2. Selection on val
+        selection_results = self.selection_on_val()
+
+        # 3. Test once (用 selection 选中的 best)
+        test_results = {}
+        for regime_name, sel in selection_results.items():
+            if sel['accepted_threshold'] is not None:
+                test_results[regime_name] = self.test_once(
+                    sel['best_individual'].params,
+                    regime=regime_name if regime_name not in ('GLOBAL', 'ROBUST') else None
+                )
+            else:
+                print(f"\n  [test-once] {regime_name} 跳过（未通过 overfit 阈值）")
+                test_results[regime_name] = None
+
+        return {
+            'train_results': self.results,
+            'selection_results': selection_results,
+            'test_results': test_results,
+        }
 
     def get_all_systems(self) -> list:
         """获取所有优化产出的指标体系"""
