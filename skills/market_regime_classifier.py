@@ -65,6 +65,16 @@ class MarketRegimeClassifier:
     - BULL: MA60>MA120 且 趋势向上
     - BEAR: MA60<MA120 且 趋势向下
     - SIDEWAYS: 其余情况
+
+    重要说明（FIX_PLAN.md Phase 4 决策）:
+    - 所有分类指标均使用历史窗口计算（无 look-ahead），pct_change(N) = close[t]/close[t-N] - 1
+    - 但 BULL/BEAR/RECOVERY 的判定依赖 20 日涨跌幅，因此存在 0-20 天的标签滞后：
+      * RECOVERY: 从 crash 结束当天起，需等 20 日才确认 recovery（实际 recovery 可能已发生）
+      * BULL/BEAR: 也依赖 20 日涨跌幅，存在类似滞后
+      * SIDEWAYS/CRASH: 判定基于更短窗口（约 5 日），滞后 0-5 天
+    - 此滞后不影响遗传算法优化（参数在 train 期内训练，滞后是 train 期内部的系统性偏差）
+    - 但在实盘使用时需要注意：当前标签描述的是"过去发生了什么"，不是"未来会发生什么"
+    - 详见 FIX_PLAN.md Phase 4
     """
 
     def __init__(self, data_dir="./stock_data"):
@@ -150,6 +160,9 @@ class MarketRegimeClassifier:
                  bear_trend_pct=-5.0) -> pd.Series:
         """
         对每个交易日标注大盘态势
+
+        注意：RECOVERY/BULL/BEAR 依赖 20 日涨跌幅，存在 0-20 天标签滞后。
+        见 MarketRegimeClassifier 类文档。
 
         Parameters:
         -----------
