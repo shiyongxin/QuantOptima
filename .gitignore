@@ -7,3 +7,6 @@ fetch_*.log
 .DS_Store
 .claude/
 optimization_package/
+
+# 本地脚本 (跟 proxy token 相关, 不入 git)
+push_via_proxy.sh
