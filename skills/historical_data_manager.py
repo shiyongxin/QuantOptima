@@ -224,8 +224,9 @@ class HistoricalDataManager:
                 existing_df = pd.read_parquet(parquet_path)
                 if len(existing_df) > 0:
                     last_date = pd.to_datetime(existing_df['日期'].iloc[-1])
-                    # 如果数据足够新(距今3天内)，直接返回
-                    if last_date >= pd.to_datetime(end_date) - timedelta(days=3):
+                    end_dt = pd.to_datetime(end_date)
+                    # 如果已有数据 >= end_date, 跳过; 否则增量从 last_date+1 取到 end_date
+                    if last_date >= end_dt:
                         return existing_df
                     # 增量获取: 从最后日期的下一天开始
                     start_date = (last_date + timedelta(days=1)).strftime("%Y%m%d")
